@@ -8,7 +8,7 @@ export default defineNuxtConfig({
   runtimeConfig: {
     // server-only secrets
     searchAccessToken: process.env.SEARCH_ACCESS_TOKEN,
-    searchEndpoint: process.env.NUXT_PUBLIC_SEARCH_ENDPOINT,
+    searchEndpoint: process.env.SEARCH_ENDPOINT,
     public: {
       googleMapsApiKey: process.env.GOOGLE_MAPS_API_KEY,
     },

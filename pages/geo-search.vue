@@ -133,7 +133,7 @@ async function runBBox(
     neLat: number;
     neLon: number;
   },
-  key?: string
+  _userInitiated: boolean
 ) {
   // Bounding-box search disabled/unused; keep signature to avoid breaking MapView emission contract
   return;
