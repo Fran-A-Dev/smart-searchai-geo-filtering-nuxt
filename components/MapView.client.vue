@@ -1,12 +1,13 @@
 <script setup lang="ts">
-import { onMounted, ref, watch, toRefs, nextTick } from "vue";
+import { onMounted, onBeforeUnmount, ref, watch, toRefs, nextTick } from "vue";
 
-type Marker = { lon: number; lat: number };
+type LatLon = { lat: number; lon: number };
+type Marker = LatLon;
 
 const props = defineProps<{
-  center: { lon: number; lat: number };
-  markers: Marker[];
-  userLocation: { lat: number; lon: number } | null;
+  center: LatLon; // { lat, lon }
+  markers: Marker[]; // search results
+  userLocation: LatLon | null; // optional blue dot
 }>();
 
 const emit = defineEmits<{
@@ -15,7 +16,7 @@ const emit = defineEmits<{
     bbox: { swLat: number; swLon: number; neLat: number; neLon: number },
     userInitiated: boolean
   ): void;
-  (e: "mapClick", location: { lat: number; lon: number }): void;
+  (e: "mapClick", location: LatLon): void;
 }>();
 
 const { center, markers, userLocation } = toRefs(props);
@@ -23,32 +24,122 @@ const mapDiv = ref<HTMLDivElement | null>(null);
 const config = useRuntimeConfig();
 
 let map: google.maps.Map | null = null;
-let markerObjs: google.maps.Marker[] = [];
+let resultMarkers: google.maps.Marker[] = [];
 let userMarker: google.maps.Marker | null = null;
 let userInitiatedMove = false;
+let idleListener: google.maps.MapsEventListener | null = null;
+let dragListener: google.maps.MapsEventListener | null = null;
+let zoomListener: google.maps.MapsEventListener | null = null;
+let clickListener: google.maps.MapsEventListener | null = null;
 
-async function loadGoogleMaps() {
-  return new Promise<void>((resolve) => {
-    if (window.google && window.google.maps) {
-      resolve();
-      return;
-    }
+/** Simple debounce to quiet idle emissions */
+function debounce<T extends (...args: any[]) => void>(fn: T, ms = 150) {
+  let t: number | undefined;
+  return (...args: Parameters<T>) => {
+    if (t) window.clearTimeout(t);
+    t = window.setTimeout(() => fn(...args), ms);
+  };
+}
 
-    const script = document.createElement('script');
-    script.src = `https://maps.googleapis.com/maps/api/js?key=${config.public.googleMapsApiKey}&libraries=places,geocoding`;
+/** Load Google Maps JS once */
+function loadGoogleMaps(): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if ((globalThis as any).google?.maps) return resolve();
+
+    const key = config.public.googleMapsApiKey;
+    if (!key) return reject(new Error("Missing GOOGLE_MAPS_API_KEY"));
+
+    const script = document.createElement("script");
+    // v=weekly per Google guidance; only `places` is a recognized library here
+    script.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(
+      key
+    )}&libraries=places&v=weekly`;
     script.async = true;
     script.defer = true;
     script.onload = () => resolve();
+    script.onerror = () => reject(new Error("Failed to load Google Maps JS"));
     document.head.appendChild(script);
   });
 }
+
+function clearResultMarkers() {
+  for (const m of resultMarkers) m.setMap(null);
+  resultMarkers = [];
+}
+
+function setResultMarkers(list: Marker[]) {
+  if (!map) return;
+  clearResultMarkers();
+
+  const bounds = new google.maps.LatLngBounds();
+  let hasAny = false;
+
+  for (const m of list) {
+    if (typeof m.lat !== "number" || typeof m.lon !== "number") continue;
+    const marker = new google.maps.Marker({
+      position: { lat: m.lat, lng: m.lon },
+      title: "Search result",
+      map,
+    });
+    resultMarkers.push(marker);
+    bounds.extend(new google.maps.LatLng(m.lat, m.lon));
+    hasAny = true;
+  }
+
+  // If no user-initiated move, fit the map to the results on fresh updates
+  if (hasAny && !userInitiatedMove) {
+    // If a single result, ensure a sensible zoom
+    if (resultMarkers.length === 1) {
+      map.setCenter({ lat: list[0].lat, lng: list[0].lon });
+      map.setZoom(Math.max(map.getZoom() || 11, 13));
+    } else {
+      map.fitBounds(bounds, 40); // 40px padding
+    }
+  }
+}
+
+function setUserLocationMarker(loc: LatLon | null) {
+  if (!map) return;
+  if (userMarker) {
+    userMarker.setMap(null);
+    userMarker = null;
+  }
+  if (!loc) return;
+
+  userMarker = new google.maps.Marker({
+    position: { lat: loc.lat, lng: loc.lon },
+    map,
+    title: "Your location",
+    icon: {
+      path: google.maps.SymbolPath.CIRCLE,
+      scale: 10,
+      fillColor: "#4285F4",
+      fillOpacity: 1,
+      strokeColor: "#FFFFFF",
+      strokeWeight: 3,
+    },
+  });
+}
+
+const emitBoundsChanged = debounce(() => {
+  if (!map) return;
+  const b = map.getBounds();
+  if (!b) return;
+  const sw = b.getSouthWest();
+  const ne = b.getNorthEast();
+  emit(
+    "boundsChanged",
+    { swLat: sw.lat(), swLon: sw.lng(), neLat: ne.lat(), neLon: ne.lng() },
+    userInitiatedMove
+  );
+  userInitiatedMove = false;
+}, 150);
 
 async function initMap() {
   await nextTick();
   const el = mapDiv.value;
   if (!el) return;
 
-  // Load Google Maps
   await loadGoogleMaps();
 
   map = new google.maps.Map(el, {
@@ -59,114 +150,60 @@ async function initMap() {
     fullscreenControl: true,
   });
 
-  // Add click listener for selecting location
-  map.addListener("click", (e: google.maps.MapMouseEvent) => {
-    if (e.latLng) {
-      emit("mapClick", {
-        lat: e.latLng.lat(),
-        lon: e.latLng.lng(),
-      });
-    }
+  clickListener = map.addListener("click", (e: google.maps.MapMouseEvent) => {
+    if (!e.latLng) return;
+    emit("mapClick", { lat: e.latLng.lat(), lon: e.latLng.lng() });
   });
 
-  map.addListener("dragstart", () => {
+  dragListener = map.addListener("dragstart", () => {
     userInitiatedMove = true;
   });
-  map.addListener("zoom_changed", () => {
+  zoomListener = map.addListener("zoom_changed", () => {
     userInitiatedMove = true;
   });
 
-  // Emit bounds changed
-  map.addListener("idle", () => {
-    if (!map) return;
-    const bounds = map.getBounds();
-    if (bounds) {
-      const sw = bounds.getSouthWest();
-      const ne = bounds.getNorthEast();
-      emit(
-        "boundsChanged",
-        {
-          swLat: sw.lat(),
-          swLon: sw.lng(),
-          neLat: ne.lat(),
-          neLon: ne.lng(),
-        },
-        userInitiatedMove
-      );
-    }
-    userInitiatedMove = false;
-  });
+  idleListener = map.addListener("idle", emitBoundsChanged);
 
-  setMarkers(markers.value);
+  // Initial render
+  setResultMarkers(markers.value);
   setUserLocationMarker(userLocation.value);
-}
-
-function setMarkers(list: Marker[]) {
-  if (!map) return;
-
-  // Remove existing markers
-  markerObjs.forEach((m) => m.setMap(null));
-  markerObjs = [];
-
-  // Add new markers
-  list.forEach((m) => {
-    const marker = new google.maps.Marker({
-      position: { lat: m.lat, lng: m.lon },
-      map: map,
-      title: "Result",
-    });
-    markerObjs.push(marker);
-  });
-}
-
-function setUserLocationMarker(location: { lat: number; lon: number } | null) {
-  if (!map) return;
-
-  // Remove existing user marker
-  if (userMarker) {
-    userMarker.setMap(null);
-    userMarker = null;
-  }
-
-  // Add new user marker with blue color
-  if (location) {
-    userMarker = new google.maps.Marker({
-      position: { lat: location.lat, lng: location.lon },
-      map: map,
-      title: "Your Location",
-      icon: {
-        path: google.maps.SymbolPath.CIRCLE,
-        scale: 10,
-        fillColor: "#4285F4",
-        fillOpacity: 1,
-        strokeColor: "#FFFFFF",
-        strokeWeight: 3,
-      },
-    });
-  }
 }
 
 onMounted(initMap);
 
+onBeforeUnmount(() => {
+  if (idleListener) idleListener.remove();
+  if (dragListener) dragListener.remove();
+  if (zoomListener) zoomListener.remove();
+  if (clickListener) clickListener.remove();
+  clearResultMarkers();
+  if (userMarker) userMarker.setMap(null);
+  map = null;
+});
+
 watch(center, (c) => {
-  if (map && c) {
-    map.setCenter({ lat: c.lat, lng: c.lon });
-  }
+  if (!map || !c) return;
+  map.setCenter({ lat: c.lat, lng: c.lon });
 });
 
 watch(
   markers,
   (list) => {
-    setMarkers(list);
+    setResultMarkers(list);
   },
   { deep: true }
 );
 
-watch(userLocation, (location) => {
-  setUserLocationMarker(location);
+watch(userLocation, (loc) => {
+  setUserLocationMarker(loc);
 });
 </script>
 
 <template>
-  <div ref="mapDiv" class="h-80 w-full rounded-xl border" />
+  <div
+    ref="mapDiv"
+    class="h-80 w-full rounded-xl border"
+    role="region"
+    aria-label="Results map"
+  />
 </template>
